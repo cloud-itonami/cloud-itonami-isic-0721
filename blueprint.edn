@@ -1,0 +1,12 @@
+[{:itonami.blueprint/id "cloud-itonami-isic-0721"
+  :itonami.blueprint/name "Uranium and Thorium Ore Mining Operations Coordination"
+  :itonami.blueprint/isic-rev4 "0721"
+  :itonami.blueprint/domain :mining/uranium-thorium
+  :itonami.blueprint/license "AGPL-3.0-or-later"
+  :itonami.blueprint/social-impact [:operational-transparency :radiological-safety :environmental-stewardship :evidence-based-decisions]
+  :itonami.blueprint/governor :uranium-thorium-mining-governor
+  :itonami.blueprint/robotics false
+  :itonami.blueprint/required-technologies [:identity :forms :dmn :bpmn :audit-ledger]
+  :itonami.blueprint/status :public-oss
+  :itonami.blueprint/maturity :implemented
+  :db/id -1}]

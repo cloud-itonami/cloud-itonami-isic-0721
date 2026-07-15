@@ -1,0 +1,147 @@
+(ns uraniumops.governor-contract-test
+  "The governor contract as executable end-to-end tests, driven through
+  the full langgraph-clj `uraniumops.operation` StateGraph (intake ->
+  advise -> govern -> decide -> commit | hold | request-approval). The
+  single invariant under test:
+
+    UraniumOpsAdvisor never commits a proposal the
+    UraniumThoriumMiningGovernor would reject, `:flag-radiological-
+    concern` and `:coordinate-shipment` ALWAYS interrupt for human
+    sign-off (never auto, at any phase), and every decision (commit OR
+    hold) leaves exactly one ledger fact."
+  (:require [clojure.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [uraniumops.advisor :as advisor]
+            [uraniumops.store :as store]
+            [uraniumops.operation :as op]))
+
+(defn- fresh []
+  (let [db (store/seed-db)]
+    [db (op/build db)]))
+
+(def operator-phase-1 {:actor-id "op-1" :actor-role :shift-supervisor :phase 1})
+(def operator-phase-3 {:actor-id "op-1" :actor-role :shift-supervisor :phase 3})
+
+(defn- exec-op [actor tid request context]
+  (g/run* actor {:request request :context context} {:thread-id tid}))
+
+(defn- approve! [actor tid]
+  (g/run* actor {:approval {:status :approved :by "op-1"}} {:thread-id tid :resume? true}))
+
+(defn- reject! [actor tid]
+  (g/run* actor {:approval {:status :rejected}} {:thread-id tid :resume? true}))
+
+(deftest clean-extraction-log-auto-commits-at-phase-3
+  (let [[db actor] (fresh)
+        res (exec-op actor "t1"
+                  {:op :log-extraction-record :site-id "uth-site-1"
+                   :patch {:tonnage 850}} operator-phase-3)]
+    (is (= :commit (get-in res [:state :disposition])))
+    (is (= 1 (count (store/coordination-log db))) "SSoT actually updated")
+    (is (= 1 (count (store/ledger db))))))
+
+(deftest clean-extraction-log-needs-approval-at-phase-1
+  (testing "phase 1 has an empty :auto set -- every write escalates for human approval, even when clean"
+    (let [[db actor] (fresh)
+          res (exec-op actor "t2" {:op :log-extraction-record :site-id "uth-site-1"
+                                   :patch {:tonnage 100}} operator-phase-1)]
+      (is (= :interrupted (:status res)))
+      (let [r2 (approve! actor "t2")]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (= 1 (count (store/coordination-log db))))))))
+
+(deftest mining-operation-auto-commits-clean-at-phase-3
+  (let [[db actor] (fresh)]
+    (exec-op actor "t3a" {:op :schedule-mining-operation :site-id "uth-site-1" :patch {:crew "day-crew-2"}} operator-phase-3)
+    (is (= [:schedule-mining-operation] (mapv :op (store/coordination-log db))))
+    (is (= 1 (count (store/ledger db))))))
+
+(deftest shipment-coordination-always-escalates-then-human-decides
+  (testing "a clean, high-confidence shipment-coordination proposal still ALWAYS interrupts for human sign-off -- IAEA-safeguarded material, never auto, at any phase"
+    (let [[db actor] (fresh)
+          r1 (exec-op actor "t4" {:op :coordinate-shipment :site-id "uth-site-1"
+                                  :patch {:carrier "secure-rail-co-1" :tonnage 850}} operator-phase-3)]
+      (is (= :interrupted (:status r1)) "pauses for human sign-off even when governor-clean and high-confidence")
+      (testing "approve -> commit, coordination record written"
+        (let [r2 (approve! actor "t4")]
+          (is (= :commit (get-in r2 [:state :disposition])))
+          (is (= 1 (count (store/coordination-log db))))
+          (is (= :coordinate-shipment (:op (first (store/coordination-log db))))))))))
+
+(deftest radiological-concern-always-escalates-then-human-decides
+  (testing "a clean, high-confidence radiological-concern flag still ALWAYS interrupts for human sign-off -- never auto, at any phase"
+    (let [[db actor] (fresh)
+          r1 (exec-op actor "t5" {:op :flag-radiological-concern :site-id "uth-site-1"
+                                  :patch {:concern "elevated gamma reading near ion-exchange skid" :confidence 0.99}} operator-phase-3)]
+      (is (= :interrupted (:status r1)) "pauses for human sign-off even when governor-clean and high-confidence")
+      (testing "approve -> commit, coordination record written"
+        (let [r2 (approve! actor "t5")]
+          (is (= :commit (get-in r2 [:state :disposition])))
+          (is (= 1 (count (store/coordination-log db))))
+          (is (= :flag-radiological-concern (:op (first (store/coordination-log db))))))))))
+
+(deftest radiological-concern-rejected-by-human-is-held-not-committed
+  (let [[db actor] (fresh)
+        _ (exec-op actor "t6" {:op :flag-radiological-concern :site-id "uth-site-1"
+                               :patch {:concern "minor dust-monitor deviation observation"}} operator-phase-3)
+        r2 (reject! actor "t6")]
+    (is (= :hold (get-in r2 [:state :disposition])))
+    (is (= [] (store/coordination-log db)) "no commit on rejection")
+    (is (= 1 (count (store/ledger db))))))
+
+(deftest unregistered-site-is-held-and-unoverridable
+  (testing "an unregistered site -> HOLD, settles immediately, never reaches request-approval"
+    (let [[db actor] (fresh)
+          res (exec-op actor "t7" {:op :log-extraction-record :site-id "uth-site-9"
+                                   :patch {:tonnage 10}} operator-phase-3)]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (not= :interrupted (:status res)))
+      (is (some #{:mine-site-unverified} (-> (store/ledger db) first :basis)))
+      (is (= [] (store/coordination-log db))))))
+
+(deftest permit-unverified-site-is-held
+  (testing "uth-site-3 exists but is registered? true / permit-verified? false -> HOLD"
+    (let [[db actor] (fresh)
+          res (exec-op actor "t8" {:op :log-extraction-record :site-id "uth-site-3"
+                                   :patch {:tonnage 10}} operator-phase-3)]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:mine-site-unverified} (-> (store/ledger db) first :basis)))
+      (is (= [] (store/coordination-log db))))))
+
+(deftest direct-actuation-effect-is-held-and-unoverridable
+  (testing "an advisor that drafts a non-:propose :effect is HARD-blocked, never reaches request-approval"
+    (let [[db _actor] (fresh)
+          rogue-advisor (reify advisor/Advisor
+                          (-advise [_ st req] (assoc (advisor/infer st req) :effect :commit)))
+          actor2 (op/build db {:advisor rogue-advisor})
+          res (exec-op actor2 "t9" {:op :coordinate-shipment :site-id "uth-site-1"
+                                    :patch {:carrier "secure-rail-co-1"}} operator-phase-3)]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (not= :interrupted (:status res)))
+      (is (some #{:effect-not-propose} (-> (store/ledger db) first :basis)))
+      (is (= [] (store/coordination-log db))))))
+
+(deftest scope-excluded-proposal-is-held-and-permanent
+  (testing "a proposal that drifts into wellfield-pump-control/drill-and-blast scope -> HARD hold, never reaches request-approval, at ANY confidence"
+    (let [[db actor] (fresh)
+          res (exec-op actor "t10" {:op :schedule-mining-operation :site-id "uth-site-1"
+                                    :out-of-scope? true :patch {}} operator-phase-3)]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (not= :interrupted (:status res)))
+      (is (some #{:scope-excluded} (-> (store/ledger db) first :basis)))
+      (is (= [] (store/coordination-log db))))))
+
+(deftest op-outside-allowlist-is-held
+  (let [[db actor] (fresh)
+        res (exec-op actor "t11" {:op :extract-material :site-id "uth-site-1"
+                                  :patch {}} operator-phase-3)]
+    (is (= :hold (get-in res [:state :disposition])))
+    (is (some #{:op-not-allowed} (-> (store/ledger db) first :basis)))))
+
+(deftest every-decision-leaves-one-ledger-fact
+  (testing "write-only-through-ledger: N operations -> N ledger facts"
+    (let [[db actor] (fresh)]
+      (exec-op actor "a" {:op :log-extraction-record :site-id "uth-site-1" :patch {:tonnage 1}} operator-phase-3)
+      (exec-op actor "b" {:op :log-extraction-record :site-id "uth-site-9" :patch {:tonnage 1}} operator-phase-3)
+      (is (= 2 (count (store/ledger db)))
+          "one commit + one hold, both recorded"))))

@@ -1,0 +1,132 @@
+(ns uraniumops.governor-test
+  "Pure unit tests of `uraniumops.governor/check` against hand-built
+  proposals -- the fast, focused complement to `governor-contract-
+  test`'s full-graph integration coverage."
+  (:require [clojure.test :refer [deftest is testing]]
+            [uraniumops.governor :as gov]
+            [uraniumops.store :as store]))
+
+(def site-1 {:site-id "uth-site-1" :name "Northern Conventional Uranium Mine"
+             :ore :uranium :method :conventional :registered? true :permit-verified? true})
+(def site-3 {:site-id "uth-site-3" :name "Southern Thorium (Monazite Sands) Mine"
+             :ore :thorium :method :conventional :registered? true :permit-verified? false})
+
+(defn- clean-proposal [op site-id]
+  {:op op :site-id site-id :summary "s" :rationale "routine back-office coordination"
+   :cites [site-id] :effect :propose :value {} :confidence 0.85})
+
+(deftest site-unregistered-is-hard
+  (testing "no site record at all -> HARD hold"
+    (let [s (store/mem-store {"uth-site-1" site-1})
+          verdict (gov/check {} nil (clean-proposal :log-extraction-record "unknown-site") s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:mine-site-unverified} (map :rule (:violations verdict)))))))
+
+(deftest site-permit-unverified-is-hard
+  (testing "site registered but permit not yet verified -> HARD hold"
+    (let [s (store/mem-store {"uth-site-3" site-3})
+          verdict (gov/check {} nil (clean-proposal :log-extraction-record "uth-site-3") s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:mine-site-unverified} (map :rule (:violations verdict)))))))
+
+(deftest effect-not-propose-is-hard
+  (testing "any :effect other than :propose is a HARD, un-overridable block"
+    (let [s (store/mem-store {"uth-site-1" site-1})
+          verdict (gov/check {} nil (assoc (clean-proposal :coordinate-shipment "uth-site-1") :effect :commit) s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:effect-not-propose} (map :rule (:violations verdict)))))))
+
+(deftest op-outside-allowlist-is-hard
+  (testing "an op outside the closed four-op allowlist is a scope violation"
+    (let [s (store/mem-store {"uth-site-1" site-1})
+          verdict (gov/check {} nil (clean-proposal :extract-material "uth-site-1") s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:op-not-allowed} (map :rule (:violations verdict)))))))
+
+(deftest drill-and-blast-content-is-hard-and-permanent
+  (testing "a proposal whose rationale touches drill-and-blast scope is HARD-blocked regardless of op/confidence"
+    (let [s (store/mem-store {"uth-site-1" site-1})
+          poisoned (assoc (clean-proposal :schedule-mining-operation "uth-site-1")
+                          :rationale "adjusted the next drill-and-blast pattern and haul truck dispatch"
+                          :confidence 0.99)
+          verdict (gov/check {} nil poisoned s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:scope-excluded} (map :rule (:violations verdict)))))))
+
+(deftest wellfield-pump-control-content-is-hard
+  (testing "a proposal touching in-situ-recovery wellfield injection well pump control is HARD-blocked, same as conventional-mining equipment control"
+    (let [s (store/mem-store {"uth-site-1" site-1})
+          poisoned (assoc (clean-proposal :schedule-mining-operation "uth-site-1")
+                          :rationale "revised the wellfield injection well pump control setpoints for pattern 4")
+          verdict (gov/check {} nil poisoned s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:scope-excluded} (map :rule (:violations verdict)))))))
+
+(deftest radiation-safety-authority-content-is-hard
+  (testing "a proposal touching radiation-safety-authority decisions (license issuance / license suspension / compliance enforcement) is HARD-blocked"
+    (let [s (store/mem-store {"uth-site-1" site-1})
+          poisoned (assoc (clean-proposal :coordinate-shipment "uth-site-1")
+                          :summary "recommend license suspension pending review")
+          verdict (gov/check {} nil poisoned s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:scope-excluded} (map :rule (:violations verdict)))))))
+
+(deftest legitimate-radiological-concern-flag-is-not-scope-excluded
+  (testing "flagging observed radiation-exposure/tailings-containment issues as a RADIOLOGICAL CONCERN (not a control decision) never trips scope-exclusion -- this actor's core valid use case must not be self-blocked"
+    (let [s (store/mem-store {"uth-site-1" site-1})
+          concern (assoc (clean-proposal :flag-radiological-concern "uth-site-1")
+                         :value {:concern "elevated gamma reading near containment berm, possible tailings seepage"})
+          verdict (gov/check {} nil concern s)]
+      (is (empty? (filter #(= :scope-excluded (:rule %)) (:violations verdict)))
+          "raw observation content (radiation exposure/tailings containment) is exactly what this op exists to surface"))))
+
+(deftest radiological-flag-always-escalates
+  (testing ":flag-radiological-concern ALWAYS escalates, even at maximum confidence"
+    (let [s (store/mem-store {"uth-site-1" site-1})
+          verdict (gov/check {} nil (assoc (clean-proposal :flag-radiological-concern "uth-site-1") :confidence 1.0) s)]
+      (is (false? (:hard? verdict)))
+      (is (true? (:escalate? verdict)))
+      (is (true? (:high-stakes? verdict)))
+      (is (false? (:ok? verdict))))))
+
+(deftest shipment-coordination-always-escalates
+  (testing ":coordinate-shipment ALWAYS escalates, even at maximum confidence -- IAEA-safeguarded material, distinct from most sibling shipment ops in this fleet"
+    (let [s (store/mem-store {"uth-site-1" site-1})
+          verdict (gov/check {} nil (assoc (clean-proposal :coordinate-shipment "uth-site-1") :confidence 1.0) s)]
+      (is (false? (:hard? verdict)))
+      (is (true? (:escalate? verdict)))
+      (is (true? (:high-stakes? verdict)))
+      (is (false? (:ok? verdict))))))
+
+(deftest low-confidence-escalates
+  (testing "confidence below the floor escalates a proposal that is otherwise clean"
+    (let [s (store/mem-store {"uth-site-1" site-1})
+          verdict (gov/check {} nil (assoc (clean-proposal :log-extraction-record "uth-site-1") :confidence 0.4) s)]
+      (is (false? (:hard? verdict)))
+      (is (true? (:escalate? verdict)))
+      (is (false? (:ok? verdict))))))
+
+(deftest hard-violation-wins-over-escalate
+  (testing "a HARD violation on an always-escalate op still reports hard?, not merely escalate?"
+    (let [s (store/mem-store {})
+          verdict (gov/check {} nil (clean-proposal :flag-radiological-concern "unknown-site") s)]
+      (is (true? (:hard? verdict)))
+      (is (false? (:escalate? verdict)) "hard? wins -- escalate? is false when hard? is true"))))
+
+(deftest happy-path-non-escalating-ops-are-clean
+  (testing "each of the two non-always-escalating ops, clean input, registered+permit-verified site -> ok"
+    (let [s (store/mem-store {"uth-site-1" site-1})]
+      (doseq [op [:log-extraction-record :schedule-mining-operation]]
+        (let [verdict (gov/check {} nil (clean-proposal op "uth-site-1") s)]
+          (is (false? (:hard? verdict)) (str op " should have no hard violations"))
+          (is (false? (:escalate? verdict)) (str op " should not escalate when clean and confident"))
+          (is (true? (:ok? verdict)) (str op " should be ok")))))))
+
+(deftest happy-path-always-escalating-ops-are-clean-but-escalate
+  (testing "each of the two always-escalating ops, clean input, registered+permit-verified site -> no HARD violation, but still escalates"
+    (let [s (store/mem-store {"uth-site-1" site-1})]
+      (doseq [op [:flag-radiological-concern :coordinate-shipment]]
+        (let [verdict (gov/check {} nil (clean-proposal op "uth-site-1") s)]
+          (is (false? (:hard? verdict)) (str op " should have no hard violations"))
+          (is (true? (:escalate? verdict)) (str op " should always escalate"))
+          (is (false? (:ok? verdict)) (str op " should not be auto-ok")))))))

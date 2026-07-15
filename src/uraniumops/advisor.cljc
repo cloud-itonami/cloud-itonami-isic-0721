@@ -1,0 +1,217 @@
+(ns uraniumops.advisor
+  "UraniumOpsAdvisor -- the *contained intelligence node* for the
+  ISIC-0721 uranium/thorium-ore mining operations-coordination actor.
+
+  It drafts exactly four kinds of back-office proposal from a closed
+  allowlist: extraction-record logging (ore tonnage/grade assay),
+  mining/haulage-operation scheduling, radiological-concern flagging
+  (radiation exposure, tailings-containment integrity), and outbound
+  ore/concentrate shipment coordination. CRITICAL: it is a
+  smart-but-untrusted advisor. It returns a *proposal* (with a
+  rationale + the fields it cited), never a committed record and NEVER
+  a direct actuation -- every proposal's `:effect` is always
+  `:propose`. Every output is censored downstream by
+  `uraniumops.governor` before anything touches the SSoT.
+
+  This advisor NEVER drafts mining-equipment control (drill-and-blast
+  sequencing, haul-truck/shaft-hoist dispatch, continuous-miner
+  operation, wellfield injection/extraction well-pump control, ion-
+  exchange/elution circuit control, leach/solvent-extraction circuit
+  control, yellowcake precipitation/drying/calcining control) or any
+  radiation-safety-certification-authority decision (radioactive-
+  material license issuance, license suspension, compliance
+  enforcement) -- those are permanently out of scope for this actor,
+  not merely un-implemented. `uraniumops.governor`'s
+  `scope-exclusion-violations` independently re-scans every proposal
+  for exactly this failure mode (a compromised or confused advisor
+  drifting into scope it must never touch) and HARD-holds it,
+  regardless of confidence or op.
+
+  Shipment coordination (`:coordinate-shipment`) is deliberately
+  treated as high-stakes here, distinct from most other coordination
+  actors in this fleet whose shipment op does not always escalate:
+  ore/concentrate leaving a uranium/thorium mine is IAEA-safeguarded
+  nuclear material, so `uraniumops.governor` always routes it to a
+  human, even when clean and high-confidence.
+
+  Like every sibling actor's advisor, this is a deterministic mock so
+  the actor graph runs offline and the governor contract is exercised
+  end-to-end. In production this calls a real LLM (kotoba-llm or
+  equivalent) with the same proposal shape.
+
+  Proposal shape (all kinds):
+    {:op         kw             ; echoes the request op
+     :site-id    str
+     :summary    str            ; human-facing draft / finding
+     :rationale  str            ; why -- SCANNED by the scope-exclusion gate
+     :cites      [str ..]       ; facts/sources the advisor used -- SCANNED too
+     :effect     :propose       ; ALWAYS :propose -- never a direct actuation
+     :value      map            ; the draft payload a human/system would review
+     :confidence 0..1}"
+  (:require #?(:clj  [clojure.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [clojure.string :as str]
+            [langchain.model :as model]))
+
+(defprotocol Advisor
+  (-advise [advisor store request] "store + request -> proposal map"))
+
+;; ----------------------------- proposal generators -----------------------------
+
+(defn- propose-extraction-record
+  "Draft an ore-tonnage/grade-assay extraction-record log entry. Pure
+  logging of ALREADY-OCCURRED extraction data -- never a decision
+  about how or when to extract."
+  [_db {:keys [site-id patch]}]
+  {:op         :log-extraction-record
+   :site-id    site-id
+   :summary    (str site-id " の採掘記録(鉱量/品位分析)を提案: " (pr-str (keys patch)))
+   :rationale  "入力された採掘量/品位分析データの記録提案のみ。新規事実の生成なし。"
+   :cites      [site-id]
+   :effect     :propose
+   :value      (merge {:site-id site-id} patch)
+   :confidence 0.93})
+
+(defn- propose-mining-operation
+  "Draft an extraction/haulage-operation scheduling proposal (a
+  calendar entry/work order draft, never a direct dispatch). Covers
+  both extraction-method families: conventional (drill-and-blast/haul
+  truck) mining and in-situ recovery (wellfield) operations."
+  [_db {:keys [site-id patch]}]
+  {:op         :schedule-mining-operation
+   :site-id    site-id
+   :summary    (str site-id " の採掘/運搬作業予定を提案: " (pr-str (keys patch)))
+   :rationale  "採掘/運搬作業スケジュールの提案のみ。実際の作業実施の判断は人間が行う。"
+   :cites      [site-id]
+   :effect     :propose
+   :value      (merge {:site-id site-id} patch)
+   :confidence 0.88})
+
+(defn- propose-radiological-concern
+  "Surface a radiation-exposure/tailings-containment concern for HUMAN
+  triage. This op ALWAYS escalates in `uraniumops.governor` -- never
+  auto-committed at any phase (`uraniumops.phase`) -- regardless of
+  how confident the advisor is that the concern is real or minor. The
+  advisor itself makes NO radiological-safety determination; it only
+  surfaces the observation."
+  [_db {:keys [site-id patch]}]
+  {:op         :flag-radiological-concern
+   :site-id    site-id
+   :summary    (str site-id " の放射線安全上の懸念を提起: " (pr-str (keys patch)))
+   :rationale  "観測された懸念事象(被ばく線量異常・テーリング(尾鉱)封じ込め異常等)の提起のみ。安全性の評価・是正措置の決定は行わない -- 常に人間審査が必要。"
+   :cites      [site-id]
+   :effect     :propose
+   :value      (merge {:site-id site-id} patch)
+   :confidence (get patch :confidence 0.9)})
+
+(defn- propose-shipment
+  "Draft outbound ore/concentrate-shipment coordination (loadout
+  scheduling, carrier/consignee handoff paperwork draft) --
+  coordination only, never the physical loadout act itself. ALWAYS
+  escalates in `uraniumops.governor`, regardless of confidence: this
+  is IAEA-safeguarded nuclear material, not ordinary industrial
+  freight."
+  [_db {:keys [site-id patch]}]
+  {:op         :coordinate-shipment
+   :site-id    site-id
+   :summary    (str site-id " の出荷調整(鉱石/精鉱)を提案: " (pr-str (keys patch)))
+   :rationale  "出荷調整(搬出スケジュール/運送業者引き渡し)案のみ。実際の搬出実施は人間が行う。IAEA保障措置対象物質のため常に人間審査が必要。"
+   :cites      [site-id]
+   :effect     :propose
+   :value      (merge {:site-id site-id} patch)
+   :confidence 0.9})
+
+(defn- propose-out-of-scope
+  "Test/failure-mode hook: drafts a proposal that touches a
+  permanently-excluded scope area (mining-equipment control /
+  radiation-safety-certification-authority decisions) so the
+  governor's `scope-exclusion-violations` HARD block can be exercised
+  directly, the same 'exercise the failure mode directly' discipline
+  every sibling actor's own sim/test suite uses. Never reachable from
+  the closed op allowlist in normal operation -- only via the
+  `:out-of-scope?` request flag."
+  [_db {:keys [site-id patch]}]
+  {:op         :schedule-mining-operation
+   :site-id    site-id
+   :summary    (str site-id " のウェルフィールド圧入井ポンプ制御(wellfield injection well pump control)の変更を提案")
+   :rationale  "次回のdrill-and-blastパターンとhaul truck dispatchを調整済み"
+   :cites      [site-id]
+   :effect     :propose
+   :value      (merge {:site-id site-id} patch)
+   :confidence 0.9})
+
+(defn infer
+  "Route a request to the right proposal generator.
+  request: {:op kw :site-id str :patch map ...}"
+  [db {:keys [op out-of-scope?] :as request}]
+  (cond
+    out-of-scope?                          (propose-out-of-scope db request)
+    (= op :log-extraction-record)          (propose-extraction-record db request)
+    (= op :schedule-mining-operation)      (propose-mining-operation db request)
+    (= op :flag-radiological-concern)      (propose-radiological-concern db request)
+    (= op :coordinate-shipment)            (propose-shipment db request)
+    :else {:op op :site-id (:site-id request)
+           :summary "未対応の操作" :rationale (str "closed allowlist に無い操作: " op)
+           :cites [] :effect :propose :value {} :confidence 0.0}))
+
+(defn mock-advisor
+  "The deterministic advisor (the `infer` logic above). Default everywhere."
+  [] (reify Advisor (-advise [_ st req] (infer st req))))
+
+;; ----------------------------- real-LLM advisor (production seam) -----------------------------
+
+(def ^:private system-prompt
+  (str "あなたはウラン/トリウム鉱石採掘サイトの運営コーディネーション助言者です。"
+       "対象サイトは在来型(露天掘り/坑内掘り)採掘またはin-situ recovery(ISR、"
+       "原位置回収)ウェルフィールドのいずれかです。"
+       "与えられた事実のみに基づき、提案を1つだけEDNマップで返します。"
+       "許可された操作は :log-extraction-record / :schedule-mining-operation / "
+       ":flag-radiological-concern / :coordinate-shipment の4つのみです。"
+       "採掘設備制御(発破/掘進順序・積込運搬機ディスパッチ・ウェルフィールド圧入/"
+       "採取井ポンプ制御・イオン交換/溶離工程制御・浸出/溶媒抽出工程制御・"
+       "イエローケーキ沈殿/乾燥/焙焼制御)や放射線安全認可機関の判断(許可発行/"
+       "免許停止/コンプライアンス執行)には絶対に触れてはいけません。"
+       "被ばく線量異常・テーリング封じ込め異常の懸念は flag-radiological-concern で"
+       "観測事実のみ提起し、評価や是正措置の決定は行いません。"
+       "出荷調整はIAEA保障措置対象物質であるため常に人間審査が必要です。"
+       "キー: :op :site-id :summary :rationale :cites :effect(常に :propose) "
+       ":value :confidence(0..1)。"))
+
+(defn- parse-proposal
+  "Parse the model's EDN proposal defensively. Any parse/shape failure
+  yields a safe low-confidence noop so the governor escalates/holds --
+  an LLM hiccup can never bypass governance."
+  [content]
+  (let [p (try (edn/read-string (str/trim (str content)))
+               (catch #?(:clj Exception :cljs :default) _ nil))]
+    (if (map? p)
+      (-> p
+          (update :cites #(vec (or % [])))
+          (update :confidence #(if (number? %) (double %) 0.0))
+          (update :effect #(or % :propose)))
+      {:summary "LLM応答を解釈できませんでした" :rationale (str content)
+       :cites [] :effect :propose :value {} :confidence 0.0})))
+
+(defn llm-advisor
+  "An advisor backed by a `langchain.model/ChatModel` (real inference)."
+  ([chat-model] (llm-advisor chat-model {}))
+  ([chat-model gen-opts]
+   (reify Advisor
+     (-advise [_ _st req]
+       (let [msgs [{:role :system :content system-prompt}
+                   {:role :user :content (str "操作: " (:op req)
+                                              "\n site: " (:site-id req)
+                                              "\n patch: " (pr-str (:patch req)))}]
+             resp (model/-generate chat-model msgs gen-opts)]
+         (parse-proposal (:content resp)))))))
+
+(defn trace
+  "Decision-grounded audit record -- persisted to the :audit channel."
+  [request proposal]
+  {:t          :advisor-proposal
+   :op         (:op request)
+   :site-id    (:site-id request)
+   :summary    (:summary proposal)
+   :rationale  (:rationale proposal)
+   :cites      (:cites proposal)
+   :confidence (:confidence proposal)})
