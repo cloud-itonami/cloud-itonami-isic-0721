@@ -127,6 +127,7 @@ structural fact, not a rollout milestone still to come — matching
 ```bash
 clojure -M:test   # run the full suite
 clojure -M:run    # walk the demo scenarios (uraniumops.sim)
+clojure -M:dev:render-html  # REAL actor -> docs/samples/operator-console.html
 clojure -M:lint    # clj-kondo
 ```
 
