@@ -19,7 +19,7 @@
   Usage: `clojure -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
   (:require [jp-go-dds.skin]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [uraniumops.advisor :as advisor]
             [uraniumops.store :as store]
             [uraniumops.operation :as op]
