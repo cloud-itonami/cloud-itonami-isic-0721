@@ -125,10 +125,10 @@ structural fact, not a rollout milestone still to come — matching
 ## Development
 
 ```bash
-clojure -M:test   # run the full suite
-clojure -M:run    # walk the demo scenarios (uraniumops.sim)
-clojure -M:dev:render-html  # REAL actor -> docs/samples/operator-console.html
-clojure -M:lint    # clj-kondo
+kbb -M:test   # run the full suite
+kbb -M:run    # walk the demo scenarios (uraniumops.sim)
+kbb -M:dev:render-html  # REAL actor -> docs/samples/operator-console.html
+kbb -M:lint    # clj-kondo
 ```
 
 AGPL-3.0-or-later, forkable by any qualified operator. Part of cloud-itonami.
