@@ -1,5 +1,5 @@
 (ns uraniumops.advisor-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [uraniumops.advisor :as advisor]
             [uraniumops.store :as store]))
 
